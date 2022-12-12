@@ -14,13 +14,14 @@ import type {
 } from '../common/Engine'
 import { Engine } from '../common/Engine'
 import { PrismaClientUnknownRequestError } from '../common/errors/PrismaClientUnknownRequestError'
+import { LogLevel } from '../common/errors/utils/log'
 import { prismaGraphQLToJSError } from '../common/errors/utils/prismaGraphQLToJSError'
 import { EventEmitter } from '../common/types/Events'
 import { EngineMetricsOptions, Metrics, MetricsOptionsJson, MetricsOptionsPrometheus } from '../common/types/Metrics'
-import { QueryEngineResult, QueryEngineResultBatchQueryResult } from '../common/types/QueryEngine'
+import { EngineSpan, QueryEngineResult, QueryEngineResultBatchQueryResult } from '../common/types/QueryEngine'
 import type * as Tx from '../common/types/Transaction'
 import { getBatchRequestPayload } from '../common/utils/getBatchRequestPayload'
-import { getInteractiveTransactionId } from '../common/utils/getInteractiveTransactionId'
+import { createSpan, getTraceParent, getTracingConfig, TracingConfig } from '../tracing'
 import { DataProxyError } from './errors/DataProxyError'
 import { ForcedRetryError } from './errors/ForcedRetryError'
 import { InvalidDatasourceError } from './errors/InvalidDatasourceError'
@@ -51,6 +52,84 @@ type RequestInternalOptions = {
   interactiveTransaction?: InteractiveTransactionOptions<DataProxyTxInfoPayload>
 }
 
+type DataProxyLog = {
+  span_id: string
+  name: string
+  level: LogLevel
+  timestamp: [number, number]
+  attributes: Record<string, unknown> & { duration_ms: number }
+}
+
+type DataProxyExtensions = {
+  logs?: DataProxyLog[]
+  traces?: EngineSpan[]
+}
+
+type DataProxyHeaders = {
+  Authorization: string
+  'X-capture-telemetry'?: string
+  traceparent?: string
+}
+
+class DataProxyHeaderBuilder {
+  readonly apiKey: string
+  readonly tracingConfig: TracingConfig
+  readonly logLevel: EngineConfig['logLevel']
+  readonly logQueries: boolean | undefined
+  readonly engine: DataProxyEngine
+
+  constructor({
+    apiKey,
+    tracingConfig,
+    logLevel,
+    logQueries,
+    engine,
+  }: {
+    apiKey: string
+    tracingConfig: TracingConfig
+    logLevel: EngineConfig['logLevel']
+    logQueries: boolean | undefined
+    engine: DataProxyEngine
+  }) {
+    this.apiKey = apiKey
+    this.tracingConfig = tracingConfig
+    this.logLevel = logLevel
+    this.logQueries = logQueries
+    this.engine = engine
+  }
+
+  build({ existingHeaders = {} }: { existingHeaders?: Record<string, string | undefined> } = {}): DataProxyHeaders {
+    const values: string[] = []
+
+    if (this.tracingConfig.enabled) {
+      values.push('tracing')
+    }
+
+    if (this.logLevel) {
+      values.push(this.logLevel)
+    }
+
+    if (this.logQueries) {
+      values.push('query')
+    }
+
+    if (!this.tracingConfig.enabled) {
+      delete existingHeaders.traceparent
+    }
+
+    const headers = {
+      ...existingHeaders,
+      Authorization: `Bearer ${this.apiKey}`,
+      'X-capture-telemetry': values.join(','),
+      ...(this.tracingConfig.enabled ? { traceparent: existingHeaders.traceparent || getTraceParent({}) } : {}),
+    }
+
+    this.engine.setHeaders(headers)
+
+    return headers
+  }
+}
+
 export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
   private inlineSchema: string
   readonly inlineSchemaHash: string
@@ -61,8 +140,9 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
 
   private clientVersion: string
   readonly remoteClientVersion: Promise<string>
-  readonly headers: { Authorization: string }
   readonly host: string
+  readonly headerBuilder: DataProxyHeaderBuilder
+  public headers: DataProxyHeaders
 
   constructor(config: EngineConfig) {
     super()
@@ -76,9 +156,19 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
     this.logEmitter = config.logEmitter
 
     const [host, apiKey] = this.extractHostAndApiKey()
-    this.remoteClientVersion = P.then(() => getClientVersion(this.config))
-    this.headers = { Authorization: `Bearer ${apiKey}` }
     this.host = host
+
+    this.headerBuilder = new DataProxyHeaderBuilder({
+      apiKey,
+      tracingConfig: getTracingConfig(this.config.previewFeatures || []),
+      logLevel: config.logLevel,
+      logQueries: config.logQueries,
+      engine: this,
+    })
+
+    this.headers = this.headerBuilder.build()
+
+    this.remoteClientVersion = P.then(() => getClientVersion(this.config))
 
     debug('host', this.host)
   }
@@ -88,8 +178,53 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
     return 'unknown'
   }
 
+  setHeaders(headers: DataProxyHeaders) {
+    this.headers = headers
+  }
+
   async start() {}
   async stop() {}
+
+  private propagateResponseExtensions(extensions: DataProxyExtensions): void {
+    const tracingConfig = getTracingConfig(this.config.previewFeatures || [])
+
+    if (extensions?.logs?.length) {
+      extensions.logs.forEach((log) => {
+        switch (log.level) {
+          case 'debug':
+          case 'error':
+          case 'trace':
+          case 'warn':
+          case 'info':
+            // TODO these are propgated into the response.errors key
+            break
+          case 'query': {
+            let dbQuery = log.name
+            if (!tracingConfig.enabled) {
+              // The engine uses tracing to consolidate logs
+              //  - and so we should strip the generated traceparent
+              //  - if tracing is disabled.
+              // Example query: 'SELECT /* traceparent=00-123-0-01 */'
+              const [query] = dbQuery.split('/* traceparent')
+              dbQuery = query
+            }
+
+            this.logEmitter.emit('query', {
+              query: dbQuery,
+              timestamp: log.timestamp,
+              duration: log.attributes.duration_ms,
+              // params: log.params - Missing
+              // target: log.target - Missing
+            })
+          }
+        }
+      })
+    }
+
+    if (extensions?.traces?.length && tracingConfig.enabled) {
+      void createSpan({ span: true, spans: extensions.traces })
+    }
+  }
 
   on(event: EngineEventType, listener: (args?: any) => any): void {
     if (event === 'beforeExit') {
@@ -116,7 +251,7 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
   private async uploadSchema() {
     const response = await request(await this.url('schema'), {
       method: 'PUT',
-      headers: this.headers,
+      headers: this.headerBuilder.build(),
       body: this.inlineSchema,
       clientVersion: this.clientVersion,
     })
@@ -141,7 +276,6 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
     { query }: EngineQuery,
     { traceparent, interactiveTransaction, customDataProxyHeaders }: RequestOptions<DataProxyTxInfoPayload>,
   ) {
-    this.logEmitter.emit('query', { query })
     // TODO: `elapsed`?
     return this.requestInternal<T>({
       body: { query, variables: {} },
@@ -156,11 +290,6 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
     { traceparent, transaction, customDataProxyHeaders }: RequestBatchOptions<DataProxyTxInfoPayload>,
   ): Promise<BatchQueryEngineResult<T>[]> {
     const isTransaction = Boolean(transaction)
-    this.logEmitter.emit('query', {
-      query: `Batch${isTransaction ? ' in transaction' : ''} (${queries.length}):\n${queries
-        .map((q) => q.query)
-        .join('\n')}`,
-    })
 
     const interactiveTransaction = transaction?.kind === 'itx' ? transaction.options : undefined
 
@@ -212,7 +341,7 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
 
         const response = await request(url, {
           method: 'POST',
-          headers: { ...headers, ...this.headers },
+          headers: this.headerBuilder.build({ existingHeaders: headers }),
           body: JSON.stringify(body),
           clientVersion: this.clientVersion,
         })
@@ -225,6 +354,10 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
         await this.handleError(e)
 
         const data = await response.json()
+        const extensions = data.extensions as DataProxyExtensions | undefined
+        if (extensions) {
+          this.propagateResponseExtensions(extensions)
+        }
 
         // TODO: headers contain `x-elapsed` and it needs to be returned
 
@@ -274,7 +407,7 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
 
           const response = await request(url, {
             method: 'POST',
-            headers: { ...headers, ...this.headers },
+            headers: this.headerBuilder.build({ existingHeaders: headers }),
             body,
             clientVersion: this.clientVersion,
           })
@@ -283,6 +416,12 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
           await this.handleError(err)
 
           const json = await response.json()
+
+          const extensions = json.extensions as DataProxyExtensions | undefined
+          if (extensions) {
+            this.propagateResponseExtensions(extensions)
+          }
+
           const id = json.id as string
           const endpoint = json['data-proxy'].endpoint as string
 
@@ -294,9 +433,15 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
 
           const response = await request(url, {
             method: 'POST',
-            headers: { ...headers, ...this.headers },
+            headers: this.headerBuilder.build({ existingHeaders: headers }),
             clientVersion: this.clientVersion,
           })
+
+          const json = await response.json()
+          const extensions = json.extensions as DataProxyExtensions | undefined
+          if (extensions) {
+            this.propagateResponseExtensions(extensions)
+          }
 
           const err = await responseToError(response, this.clientVersion)
           await this.handleError(err)
