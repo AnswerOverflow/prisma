@@ -113,15 +113,16 @@ class DataProxyHeaderBuilder {
       values.push('query')
     }
 
-    if (!this.tracingConfig.enabled) {
-      delete existingHeaders.traceparent
-    }
-
-    const headers = {
+    const headers: DataProxyHeaders = {
       ...existingHeaders,
       Authorization: `Bearer ${this.apiKey}`,
       'X-capture-telemetry': values.join(','),
-      ...(this.tracingConfig.enabled ? { traceparent: existingHeaders.traceparent || getTraceParent({}) } : {}),
+    }
+
+    if (this.tracingConfig.enabled) {
+      headers.traceparent ??= getTraceParent({})
+    } else {
+      delete headers.traceparent
     }
 
     this.engine.setHeaders(headers)
