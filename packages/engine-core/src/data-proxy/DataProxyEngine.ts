@@ -71,6 +71,12 @@ type DataProxyHeaders = {
   traceparent?: string
 }
 
+type HeaderBuilderOptions = {
+  traceparent?: string
+  interactiveTransaction?: InteractiveTransactionOptions<DataProxyTxInfoPayload>
+  customHeaders?: Record<string, string>
+}
+
 class DataProxyHeaderBuilder {
   readonly apiKey: string
   readonly tracingConfig: TracingConfig
@@ -98,31 +104,35 @@ class DataProxyHeaderBuilder {
     this.engine = engine
   }
 
-  build({ existingHeaders = {} }: { existingHeaders?: Record<string, string | undefined> } = {}): DataProxyHeaders {
-    const values: string[] = []
+  build({ traceparent, interactiveTransaction, customHeaders }: HeaderBuilderOptions = {}): DataProxyHeaders {
+    const headers: DataProxyHeaders = {
+      Authorization: `Bearer ${this.apiKey}`,
+    }
 
     if (this.tracingConfig.enabled) {
-      values.push('tracing')
+      headers.traceparent = traceparent ?? getTraceParent({})
+    }
+
+    if (interactiveTransaction) {
+      headers['X-transaction-id'] = interactiveTransaction.id
+    }
+
+    const captureTelemetry: string[] = []
+
+    if (this.tracingConfig.enabled) {
+      captureTelemetry.push('tracing')
     }
 
     if (this.logLevel) {
-      values.push(this.logLevel)
+      captureTelemetry.push(this.logLevel)
     }
 
     if (this.logQueries) {
-      values.push('query')
+      captureTelemetry.push('query')
     }
 
-    const headers: DataProxyHeaders = {
-      ...existingHeaders,
-      Authorization: `Bearer ${this.apiKey}`,
-      'X-capture-telemetry': values.join(','),
-    }
-
-    if (this.tracingConfig.enabled) {
-      headers.traceparent ??= getTraceParent({})
-    } else {
-      delete headers.traceparent
+    if (captureTelemetry.length > 0) {
+      headers['X-capture-telemetry'] = captureTelemetry.join(', ')
     }
 
     this.engine.setHeaders(headers)
@@ -332,18 +342,9 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
 
         logHttpCall(url)
 
-        const headers: Record<string, string> = { ...customHeaders }
-        if (traceparent) {
-          headers.traceparent = traceparent
-        }
-
-        if (interactiveTransaction) {
-          headers['X-transaction-id'] = interactiveTransaction.id
-        }
-
         const response = await request(url, {
           method: 'POST',
-          headers: this.headerBuilder.build({ existingHeaders: headers }),
+          headers: this.headerBuilder.build({ traceparent, customHeaders, interactiveTransaction }),
           body: JSON.stringify(body),
           clientVersion: this.clientVersion,
         })
@@ -409,7 +410,7 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
 
           const response = await request(url, {
             method: 'POST',
-            headers: this.headerBuilder.build({ existingHeaders: headers }),
+            headers: this.headerBuilder.build({ traceparent: headers.traceparent }),
             body,
             clientVersion: this.clientVersion,
           })
@@ -435,7 +436,7 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
 
           const response = await request(url, {
             method: 'POST',
-            headers: this.headerBuilder.build({ existingHeaders: headers }),
+            headers: this.headerBuilder.build({ traceparent: headers.traceparent }),
             clientVersion: this.clientVersion,
           })
 
