@@ -104,6 +104,7 @@ class DataProxyHeaderBuilder {
   build({ traceparent, interactiveTransaction, customHeaders }: HeaderBuilderOptions = {}): DataProxyHeaders {
     const headers: DataProxyHeaders = {
       Authorization: `Bearer ${this.apiKey}`,
+      ...customHeaders,
     }
 
     if (this.tracingConfig.enabled) {
