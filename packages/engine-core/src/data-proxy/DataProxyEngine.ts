@@ -200,7 +200,8 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
             // TODO these are propgated into the response.errors key
             break
           case 'query': {
-            let dbQuery = log.attributes?.query || log.name
+            let dbQuery =
+              typeof log.attributes?.query === 'string' && log.attributes?.query ? log.attributes.query : log.name
             if (!tracingConfig.enabled) {
               // The engine uses tracing to consolidate logs
               //  - and so we should strip the generated traceparent
