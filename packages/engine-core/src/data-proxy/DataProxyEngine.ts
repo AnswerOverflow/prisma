@@ -299,8 +299,6 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
     queries: EngineQuery[],
     { traceparent, transaction, customDataProxyHeaders }: RequestBatchOptions<DataProxyTxInfoPayload>,
   ): Promise<BatchQueryEngineResult<T>[]> {
-    const isTransaction = Boolean(transaction)
-
     const interactiveTransaction = transaction?.kind === 'itx' ? transaction.options : undefined
 
     const body = getBatchRequestPayload(queries, transaction)
