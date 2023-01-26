@@ -82,14 +82,12 @@ class DataProxyHeaderBuilder {
   readonly tracingConfig: TracingConfig
   readonly logLevel: EngineConfig['logLevel']
   readonly logQueries: boolean | undefined
-  readonly engine: DataProxyEngine
 
   constructor({
     apiKey,
     tracingConfig,
     logLevel,
     logQueries,
-    engine,
   }: {
     apiKey: string
     tracingConfig: TracingConfig
@@ -101,7 +99,6 @@ class DataProxyHeaderBuilder {
     this.tracingConfig = tracingConfig
     this.logLevel = logLevel
     this.logQueries = logQueries
-    this.engine = engine
   }
 
   build({ traceparent, interactiveTransaction, customHeaders }: HeaderBuilderOptions = {}): DataProxyHeaders {
@@ -117,6 +114,16 @@ class DataProxyHeaderBuilder {
       headers['X-transaction-id'] = interactiveTransaction.id
     }
 
+    const captureTelemetry: string[] = this.buildCaptureSettings()
+
+    if (captureTelemetry.length > 0) {
+      headers['X-capture-telemetry'] = captureTelemetry.join(', ')
+    }
+
+    return headers
+  }
+
+  private buildCaptureSettings() {
     const captureTelemetry: string[] = []
 
     if (this.tracingConfig.enabled) {
@@ -130,14 +137,7 @@ class DataProxyHeaderBuilder {
     if (this.logQueries) {
       captureTelemetry.push('query')
     }
-
-    if (captureTelemetry.length > 0) {
-      headers['X-capture-telemetry'] = captureTelemetry.join(', ')
-    }
-
-    this.engine.setHeaders(headers)
-
-    return headers
+    return captureTelemetry
   }
 }
 
@@ -153,7 +153,6 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
   readonly remoteClientVersion: Promise<string>
   readonly host: string
   readonly headerBuilder: DataProxyHeaderBuilder
-  public headers: DataProxyHeaders
 
   constructor(config: EngineConfig) {
     super()
@@ -177,20 +176,18 @@ export class DataProxyEngine extends Engine<DataProxyTxInfoPayload> {
       engine: this,
     })
 
-    this.headers = this.headerBuilder.build()
-
     this.remoteClientVersion = P.then(() => getClientVersion(this.config))
 
     debug('host', this.host)
   }
 
+  apiKey(): string {
+    return this.headerBuilder.apiKey
+  }
+
   version() {
     // QE is remote, we don't need to know the exact commit SHA
     return 'unknown'
-  }
-
-  setHeaders(headers: DataProxyHeaders) {
-    this.headers = headers
   }
 
   async start() {}
